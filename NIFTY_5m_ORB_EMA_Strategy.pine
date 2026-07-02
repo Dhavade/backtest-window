@@ -1,0 +1,305 @@
+//@version=5
+strategy("NIFTY 5m ORB + Filtered EMA Strategy (Stable)", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, margin_long=100, margin_short=100)
+
+// =============================================================================
+// 1. INPUTS & CONFIGURATIONS
+// =============================================================================
+
+// Backtest Date Range Settings
+group_backtest     = "Backtest Range Settings"
+startDate          = input.time(timestamp("2023-01-01 00:00 +0530"), "Start Date", group=group_backtest)
+endDate            = input.time(timestamp("2030-01-01 23:59 +0530"), "End Date", group=group_backtest)
+
+// General Strategy Config
+group_general      = "General Strategy Configurations"
+allowMultiple      = input.bool(false, "Allow concurrent EMA & ORB trades", group=group_general, tooltip="If false, no new trade is taken if any position is already active.")
+
+// ORB Settings
+group_orb          = "Opening Range Breakout (ORB) Settings"
+enableORB          = input.bool(true, "Enable ORB Strategy", group=group_orb)
+useInsideBarFilter = input.bool(true, "Require 2nd candle to be Inside Bar (Original)", group=group_orb, tooltip="If true, breakouts only trigger if the 2nd candle stays inside the 1st candle's range.")
+orbSLType          = input.string("Opposite Range", "ORB Stop Loss Type", options=["Opposite Range", "Fixed Points", "Percentage"], group=group_orb)
+orbSLValue         = input.float(30.0, "ORB Stop Loss Value (Points/%)", group=group_orb, tooltip="Ignored if 'Opposite Range' is chosen.")
+orbTPType          = input.string("Risk Reward", "ORB Take Profit Type", options=["Risk Reward", "Fixed Points", "Percentage"], group=group_orb)
+orbTPValue         = input.float(2.0, "ORB Take Profit Value (Points/%/RR)", group=group_orb, tooltip="For Risk Reward, e.g., 2.0 means 1:2 Risk to Reward ratio.")
+
+// EMA Settings
+group_ema          = "EMA Strategy Settings (After 12:00 PM)"
+enableEMA          = input.bool(true, "Enable EMA Strategy", group=group_ema)
+fastEMALen         = input.int(9, "Fast EMA Length", group=group_ema)
+slowEMALen         = input.int(20, "Slow EMA Length", group=group_ema)
+adxLen             = input.int(14, "ADX Length", group=group_ema)
+adxThreshold       = input.int(20, "ADX Threshold Filter", group=group_ema)
+ema20Lookback      = input.int(5, "EMA 20 Slope Lookback Bars", group=group_ema)
+emaSLType          = input.string("Fixed Points", "EMA Stop Loss Type", options=["Fixed Points", "Percentage"], group=group_ema)
+emaSLValue         = input.float(40.0, "EMA Stop Loss Value (Points/%)", group=group_ema)
+emaTPType          = input.string("Risk Reward", "EMA Take Profit Type", options=["Risk Reward", "Fixed Points", "Percentage"], group=group_ema)
+emaTPValue         = input.float(2.0, "EMA Take Profit Value (Points/%/RR)", group=group_ema)
+
+// Session & Timezone Settings
+group_session      = "Session & Timezone Settings"
+targetTZ           = input.string("Asia/Kolkata", "Exchange Timezone", group=group_session, tooltip="Timezone used to calculate bars and sessions.")
+startHour          = input.int(9, "ORB Start Hour (IST)", group=group_session)
+startMinute        = input.int(15, "ORB Start Minute (IST)", group=group_session)
+sqOffHour          = input.int(15, "Square-off Hour (IST)", group=group_session)
+sqOffMin           = input.int(15, "Square-off Minute (IST)", group=group_session)
+
+// Visual Settings
+group_visual       = "Visual Settings"
+showEMAPlots       = input.bool(true, "Show EMAs on Chart", group=group_visual)
+showORBPlots       = input.bool(true, "Show ORB Level Lines", group=group_visual)
+showDashboard      = input.bool(true, "Show Dashboard Table", group=group_visual)
+ema9Color          = input.color(color.orange, "EMA 9 Line Color", group=group_visual)
+ema20Color         = input.color(color.black, "EMA 20 Line Color", group=group_visual)
+
+// =============================================================================
+// 2. TIMING & TIMEFRAME CHECKS
+// =============================================================================
+
+// Ensure timeframe is set to 5m to avoid incorrect calculations
+if not timeframe.isintraday or timeframe.multiplier != 5 or timeframe.isseconds
+    runtime.error("This script is designed for the 5-Minute timeframe only. Please switch your chart timeframe to 5m.")
+
+// Backtest time validation
+inDateRange = time >= startDate and time <= endDate
+
+// Local time variables matching exchange timezone
+current_hour   = hour(time, targetTZ)
+current_minute = minute(time, targetTZ)
+
+// Check intraday state
+is_before_sqoff = (current_hour < sqOffHour) or (current_hour == sqOffHour and current_minute < sqOffMin)
+is_sqoff_time   = (current_hour == sqOffHour and current_minute >= sqOffMin) or (current_hour > sqOffHour)
+
+// =============================================================================
+// 3. INDICATOR CALCULATIONS
+// =============================================================================
+
+// EMAs
+ema9  = ta.ema(close, fastEMALen)
+ema20 = ta.ema(close, slowEMALen)
+
+// ADX
+[plusDI, minusDI, adx] = ta.dmi(adxLen, adxLen)
+
+// EMA slope filter
+ema20Up   = ema20 > ema20[ema20Lookback]
+ema20Down = ema20 < ema20[ema20Lookback]
+
+// Price position filter
+priceAbove = close > ema9 and close > ema20
+priceBelow = close < ema9 and close < ema20
+
+// Time filter for EMA (After 12 PM)
+emaTimeOK = (current_hour > 12) or (current_hour == 12 and current_minute >= 0)
+
+// =============================================================================
+// 4. STRATEGY RULES LOGIC
+// =============================================================================
+
+// Day Change Detection
+is_new_day = ta.change(time("D", targetTZ))
+
+// Track bars within the day
+var int barCount = 0
+if is_new_day
+    barCount := 0
+barCount := barCount + 1
+
+isFirstBar  = barCount == 1
+isSecondBar = barCount == 2
+
+// State Variables
+var float firstHigh = na
+var float firstLow  = na
+var bool insideBar  = false
+var bool boTaken    = false
+
+// Reset daily levels
+if is_new_day
+    firstHigh := na
+    firstLow  := na
+    insideBar := false
+    boTaken   := false
+
+// Capture first candle (starts at 09:15)
+if isFirstBar
+    firstHigh := high
+    firstLow  := low
+
+// Inside bar check on second candle (starts at 09:20)
+if isSecondBar
+    insideBar := high <= firstHigh and low >= firstLow
+
+// Allowed ORB breakout state
+allowORB = false
+if useInsideBarFilter
+    allowORB := insideBar and (barCount >= 3)
+else
+    allowORB := barCount >= 2
+
+// Core signal conditions
+boBuy  = allowORB and close > firstHigh and not boTaken and is_before_sqoff
+boSell = allowORB and close < firstLow  and not boTaken and is_before_sqoff
+
+emaBuy  = ta.crossover(ema9, ema20) and emaTimeOK and ema20Up and priceAbove and adx > adxThreshold and is_before_sqoff
+emaSell = ta.crossunder(ema9, ema20) and emaTimeOK and ema20Down and priceBelow and adx > adxThreshold and is_before_sqoff
+
+// Position eligibility check
+canEnter = allowMultiple or (strategy.position_size == 0)
+
+// Combined entry triggers
+boBuyTrigger   = boBuy and canEnter and inDateRange
+boSellTrigger  = boSell and canEnter and inDateRange
+emaBuyTrigger  = emaBuy and canEnter and inDateRange
+emaSellTrigger = emaSell and canEnter and inDateRange
+
+// =============================================================================
+// 5. STRATEGY ENTRY & EXIT EXECUTIONS
+// =============================================================================
+
+// Persistent trade variables for SL/TP tracking
+var float activeSL = na
+var float activeTP = na
+
+// ---------------------- ORB LONG ----------------------
+if boBuyTrigger and enableORB
+    // Calculate Stop Loss
+    if orbSLType == "Opposite Range"
+        activeSL := firstLow
+    else if orbSLType == "Fixed Points"
+        activeSL := close - orbSLValue
+    else if orbSLType == "Percentage"
+        activeSL := close * (1 - orbSLValue / 100)
+    
+    // Calculate Take Profit
+    risk = close - activeSL
+    if orbTPType == "Risk Reward"
+        activeTP := close + (risk * orbTPValue)
+    else if orbTPType == "Fixed Points"
+        activeTP := close + orbTPValue
+    else if orbTPType == "Percentage"
+        activeTP := close * (1 + orbTPValue / 100)
+        
+    strategy.entry("ORB Long", strategy.long, comment="ORB Buy")
+    strategy.exit("ORB Long Exit", "ORB Long", stop=activeSL, limit=activeTP)
+    boTaken := true
+    alert("ORB BUY: NIFTY closed above opening range high!", alert.freq_once_per_bar)
+
+// ---------------------- ORB SHORT ---------------------
+if boSellTrigger and enableORB
+    // Calculate Stop Loss
+    if orbSLType == "Opposite Range"
+        activeSL := firstHigh
+    else if orbSLType == "Fixed Points"
+        activeSL := close + orbSLValue
+    else if orbSLType == "Percentage"
+        activeSL := close * (1 + orbSLValue / 100)
+    
+    // Calculate Take Profit
+    risk = activeSL - close
+    if orbTPType == "Risk Reward"
+        activeTP := close - (risk * orbTPValue)
+    else if orbTPType == "Fixed Points"
+        activeTP := close - orbTPValue
+    else if orbTPType == "Percentage"
+        activeTP := close * (1 - orbTPValue / 100)
+        
+    strategy.entry("ORB Short", strategy.short, comment="ORB Sell")
+    strategy.exit("ORB Short Exit", "ORB Short", stop=activeSL, limit=activeTP)
+    boTaken := true
+    alert("ORB SELL: NIFTY closed below opening range low!", alert.freq_once_per_bar)
+
+// ---------------------- EMA LONG ----------------------
+if emaBuyTrigger and enableEMA
+    // Calculate Stop Loss
+    if emaSLType == "Fixed Points"
+        activeSL := close - emaSLValue
+    else if emaSLType == "Percentage"
+        activeSL := close * (1 - emaSLValue / 100)
+    
+    // Calculate Take Profit
+    risk = close - activeSL
+    if emaTPType == "Risk Reward"
+        activeTP := close + (risk * emaTPValue)
+    else if emaTPType == "Fixed Points"
+        activeTP := close + emaTPValue
+    else if emaTPType == "Percentage"
+        activeTP := close * (1 + emaTPValue / 100)
+        
+    strategy.entry("EMA Long", strategy.long, comment="EMA Buy")
+    strategy.exit("EMA Long Exit", "EMA Long", stop=activeSL, limit=activeTP)
+    alert("EMA BUY: EMA 9 crossed above EMA 20 with trend filter!", alert.freq_once_per_bar)
+
+// ---------------------- EMA SHORT ---------------------
+if emaSellTrigger and enableEMA
+    // Calculate Stop Loss
+    if emaSLType == "Fixed Points"
+        activeSL := close + emaSLValue
+    else if emaSLType == "Percentage"
+        activeSL := close * (1 + emaSLValue / 100)
+    
+    // Calculate Take Profit
+    risk = activeSL - close
+    if emaTPType == "Risk Reward"
+        activeTP := close - (risk * emaTPValue)
+    else if emaTPType == "Fixed Points"
+        activeTP := close - emaTPValue
+    else if emaTPType == "Percentage"
+        activeTP := close * (1 - emaTPValue / 100)
+        
+    strategy.entry("EMA Short", strategy.short, comment="EMA Sell")
+    strategy.exit("EMA Short Exit", "EMA Short", stop=activeSL, limit=activeTP)
+    alert("EMA SELL: EMA 9 crossed below EMA 20 with trend filter!", alert.freq_once_per_bar)
+
+// ----------------- INTRADAY SQUARE OFF -----------------
+if is_sqoff_time
+    strategy.close_all(comment="Intraday Square-off")
+
+// =============================================================================
+// 6. CHART PLOTS & VISUALS
+// =============================================================================
+
+// EMA plots
+plot(showEMAPlots ? ema9 : na,  color=ema9Color,  linewidth=2, title="EMA 9")
+plot(showEMAPlots ? ema20 : na, color=ema20Color, linewidth=2, title="EMA 20")
+
+// ORB Level plots
+plot(showORBPlots ? firstHigh : na, title="1st Candle High", color=color.green, linewidth=1, style=plot.style_linebr)
+plot(showORBPlots ? firstLow  : na, title="1st Candle Low",  color=color.red,   linewidth=1, style=plot.style_linebr)
+
+// Plot Shape Triggers on Signals
+plotshape(boBuyTrigger,   location=location.belowbar, color=color.lime,   style=shape.triangleup,   text="BO BUY", size=size.normal, title="ORB Buy Shape")
+plotshape(boSellTrigger,  location=location.abovebar, color=color.maroon, style=shape.triangledown, text="BO SELL", size=size.normal, title="ORB Sell Shape")
+plotshape(emaBuyTrigger,  location=location.belowbar, color=color.green,  style=shape.labelup,      text="EMA BUY", textcolor=color.white, size=size.normal, title="EMA Buy Shape")
+plotshape(emaSellTrigger, location=location.abovebar, color=color.red,    style=shape.labeldown,    text="EMA SELL", textcolor=color.white, size=size.normal, title="EMA Sell Shape")
+
+// Backtest Range Highlight
+bgcolor(inDateRange ? color.new(color.blue, 97) : na, title="Backtest Range Highlight")
+
+// =============================================================================
+// 7. REAL-TIME STATS DASHBOARD
+// =============================================================================
+var table infoTable = table.new(position.top_right, 2, 5, bgcolor=color.new(color.black, 15), border_color=color.gray, border_width=1)
+
+if showDashboard and barstate.islast
+    // Header Style
+    color headerBg = color.rgb(33, 150, 243)
+    table.cell(infoTable, 0, 0, "Metric", text_color=color.white, bgcolor=headerBg, text_size=size.small)
+    table.cell(infoTable, 1, 0, "Value", text_color=color.white, bgcolor=headerBg, text_size=size.small)
+    
+    // ORB High
+    table.cell(infoTable, 0, 1, "ORB High", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, na(firstHigh) ? "N/A" : str.tostring(firstHigh, "#.##"), text_color=color.lime, text_size=size.small)
+    
+    // ORB Low
+    table.cell(infoTable, 0, 2, "ORB Low", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, na(firstLow) ? "N/A" : str.tostring(firstLow, "#.##"), text_color=color.red, text_size=size.small)
+    
+    // Inside Bar Status
+    table.cell(infoTable, 0, 3, "2nd Candle Inside Bar?", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, insideBar ? "Yes (Valid)" : "No", text_color=insideBar ? color.green : color.orange, text_size=size.small)
+    
+    // ORB Trade Taken today?
+    table.cell(infoTable, 0, 4, "ORB Entry Executed?", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 4, boTaken ? "Yes" : "No", text_color=boTaken ? color.green : color.yellow, text_size=size.small)
